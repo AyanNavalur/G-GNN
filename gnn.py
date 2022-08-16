@@ -1,4 +1,7 @@
 import argparse
+import numpy as np
+import random
+import os
 
 import torch
 import torch.nn.functional as F
@@ -75,6 +78,52 @@ class SAGE(torch.nn.Module):
         x = self.convs[-1](x, adj_t)
         return x.log_softmax(dim=-1)
 
+
+def train(model, data, train_idx, optimizer):
+    model.train()
+
+    optimizer.zero_grad()
+    out = model(data.x, data.adj_t)[train_idx]
+    loss = F.nll_loss(out, data.y.squeeze(1)[train_idx])
+    loss.backward()
+    optimizer.step()
+
+    return loss.item()
+
+
+@torch.no_grad()
+def test(model, data, split_idx, evaluator):
+    model.eval()
+
+    out = model(data.x, data.adj_t)
+    y_pred = out.argmax(dim=-1, keepdim=True)
+
+    train_acc = evaluator.eval({
+        'y_true': data.y[split_idx['train']],
+        'y_pred': y_pred[split_idx['train']],
+    })['acc']
+    valid_acc = evaluator.eval({
+        'y_true': data.y[split_idx['valid']],
+        'y_pred': y_pred[split_idx['valid']],
+    })['acc']
+    test_acc = evaluator.eval({
+        'y_true': data.y[split_idx['test']],
+        'y_pred': y_pred[split_idx['test']],
+    })['acc']
+
+    return (train_acc, valid_acc, test_acc), out
+
+
+def set_seed(_seed):
+    torch.manual_seed(_seed)
+    torch.cuda.manual_seed_all(_seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(_seed)
+    random.seed(_seed)
+    os.environ['PYTHONHASHSEED'] = str(_seed)
+
+
 def main():
     parser = argparse.ArgumentParser(description='OGBN-Arxiv (GNN)')
     parser.add_argument('--device', type=int, default=0)
@@ -114,13 +163,28 @@ def main():
     evaluator = Evaluator(name='ogbn-arxiv')
     logger = Logger(args.runs, args)
 
+    random_state = np.random.RandomState(5555)
+    run_seeds_lst = random_state.randint(0, 1000000, args['runs'])
+
     for run in range(args.runs):
+        set_seed(run_seeds_lst[run])
         model.reset_parameters()
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        best_valid = 0
+        best_run = 0
+        best_out = None
+        best_model = None
+        losses = []
         for epoch in range(1, 1 + args.epochs):
             loss = train(model, data, train_idx, optimizer)
             result = test(model, data, split_idx, evaluator)
+            # result, out = test(model, data, split_idx, evaluator)
             logger.add_result(run, result)
+            train_acc, valid_acc, test_acc = result
+            if valid_acc > best_valid:
+                best_valid = valid_acc
+                # best_out = out.cpu().exp()
+                best_run = epoch
 
             if epoch % args.log_steps == 0:
                 train_acc, valid_acc, test_acc = result
@@ -131,7 +195,12 @@ def main():
                       f'Valid: {100 * valid_acc:.2f}% '
                       f'Test: {100 * test_acc:.2f}%')
 
-        logger.print_statistics(run)
+        # to save the output of model
+        # torch.save(best_out, f'{run}.pt')
+
+        # todo save model state_dict for further use
+
+    logger.print_statistics(run)
     logger.print_statistics()
 
 
