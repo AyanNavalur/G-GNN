@@ -1,21 +1,24 @@
-import argparse
-import time
-import os
-from torch import Tensor
-
-import numpy as np
-import torch
-from torch_geometric.nn import GCNConv, ChebConv
-from torch_geometric.utils import to_scipy_sparse_matrix, index_to_mask  # noqa
-import torch.nn.functional as F
-from ogb.nodeproppred import Evaluator
-
-from gnn import GCN, SAGE
-from logger import Logger
-from data import get_dataset, set_fixed_train_val_test_split, set_ratio_train_valid_test_split
-from best_params import best_params_dict
-from utils import ROOT_DIR
 import json
+from utils import ROOT_DIR
+from best_params import best_params_dict
+from data import get_dataset, set_fixed_train_val_test_split, set_ratio_train_valid_test_split
+from logger import Logger
+from gnn import GCN, SAGE
+from ogb.nodeproppred import Evaluator
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, ChebConv
+import torch
+import numpy as np
+from torch import Tensor
+import os
+import time
+import argparse
+import random
+import pathlib
+from accuracy import get_accuracy
+
+from torch_geometric.utils import to_scipy_sparse_matrix, index_to_mask  # noqa
+
 # from CGNN import CGNN, get_sym_adj
 # from CGNN import train as train_cgnn
 
@@ -99,7 +102,7 @@ def test(model, data, split_idx, evaluator):
         'y_pred': y_pred[split_idx['test']],
     })['acc']
 
-    return train_acc, valid_acc, test_acc
+    return (train_acc, valid_acc, test_acc), out
 
 
 def print_model_params(model):
@@ -133,6 +136,16 @@ def merge_cmd_args(cmd_opt, opt):
         opt['not_lcc'] = False
     if cmd_opt['num_splits'] != 1:
         opt['num_splits'] = cmd_opt['num_splits']
+
+
+def set_seed(_seed):
+    torch.manual_seed(_seed)
+    torch.cuda.manual_seed_all(_seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(_seed)
+    random.seed(_seed)
+    os.environ['PYTHONHASHSEED'] = str(_seed)
 
 
 def main(cmd_opt):
@@ -180,13 +193,31 @@ def main(cmd_opt):
         opt['optimizer'], parameters, lr=opt['lr'], weight_decay=opt['decay'])
     best_time = best_epoch = train_acc = val_acc = test_acc = 0
 
+    random_state = np.random.RandomState(5555)
+    run_seeds_lst = random_state.randint(0, 1000000, opt['runs'])
+
+    # create directories if do not exist
+    pathlib.Path(
+        f'{ROOT_DIR}/output/{opt["dataset"]}').mkdir(parents=True, exist_ok=True)
+
     for run in range(args.runs):
+        set_seed(run_seeds_lst[run])
         model.reset_parameters()
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        best_valid = 0
+        best_run = 0
+        best_out = None
+        best_model = None
+        losses = []
         for epoch in range(1, 1 + args.epochs):
             loss = train(model, data, train_idx, optimizer)
-            result = test(model, data, split_idx, evaluator)
+            result, out = test(model, data, split_idx, evaluator)
             logger.add_result(run, result)
+            train_acc, valid_acc, test_acc = result
+            if valid_acc > best_valid:
+                best_valid = valid_acc
+                best_out = out.cpu().exp()
+                best_run = epoch
 
             if epoch % args.log_steps == 0:
                 train_acc, valid_acc, test_acc = result
@@ -196,8 +227,16 @@ def main(cmd_opt):
                       f'Train: {100 * train_acc:.2f}%, '
                       f'Valid: {100 * valid_acc:.2f}% '
                       f'Test: {100 * test_acc:.2f}%')
+
+        # to save the output of model
+        torch.save(best_out, f'{ROOT_DIR}/output/{opt["dataset"]}/{run}.pt')
         logger.print_statistics(run)
     train_final, valid_final, test_final = logger.print_statistics()
+
+    accuracy_result = get_accuracy(opt)
+    accuracy_file = open(args.accuracypath, "a+", encoding='utf-8')
+    accuracy_file.write(json.dumps(accuracy_result) + '\n')
+    accuracy_file.close()
 
     result = {"Dataset": args.external_dataset, "Model": args.booster, "train_ratio": int(args.train_ratio),
               "Average Train": train_final, " Average Valid": valid_final, " Average Test": test_final}
@@ -234,6 +273,8 @@ if __name__ == '__main__':
                         help="Random seed (for reproducibility).")
     parser.add_argument("--outputpath", type=str, default="empty.json",
                         help="outputh file path to save the result")
+    parser.add_argument("--accuracypath", type=str, default="accuracy.json",
+                        help="accuracy file path to save the accuracy result")
     parser.add_argument("--train_ratio", type=float, default=1.,
                         help="the start value of the train ratio (inclusive).")
     parser.add_argument("--split_policy", type=str, default='fixed',
@@ -246,6 +287,7 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_channels', type=int, default=256)
     parser.add_argument('--dropout', type=float, default=0.5)
     parser.add_argument('--lr', type=float, default=0.01)
+    # parser.add_argument('--epochs', type=int, default=3)
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--runs', type=int, default=10)
     # parser.add_argument("--splits", type=int, default=5,
